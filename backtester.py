@@ -3,12 +3,13 @@ Backtest Engine for evaluating HFT strategies on historical data.
 """
 import asyncio
 import logging
-from typing import List, Dict
+from typing import Dict, Optional
 from ingestor import HistoricalDataIngestor
 from strategy import EnsembleStrategy, MovingAverageStrategy, RSIStrategy
 from risk import RiskManager
 from execution import ExecutionHandler
 from models import TickerData, Position
+from utils import calculate_max_drawdown
 
 
 class Backtester:
@@ -29,7 +30,10 @@ class Backtester:
         self.risk = RiskManager(daily_loss_limit_usd=10000.0) # Looser limits for backtesting
         self.execution = ExecutionHandler(is_paper_trading=True)
         self.ingestor = HistoricalDataIngestor(data_file, symbol, self.handle_ticker)
-        
+
+        self.open_positions: Dict[str, Dict] = {}
+        self.equity_curve = [self.risk.total_equity_usd]
+
         self.metrics = {
             "total_trades": 0,
             "total_pnl": 0.0,
@@ -45,20 +49,58 @@ class Backtester:
         if not signal:
             return
 
-        if self.risk.validate_signal(signal):
-            position = await self.execution.execute_order(signal)
-            if position:
-                self.risk.update_position(position)
-                self.metrics["total_trades"] += 1
-                # Simple PnL simulation (mocked for now in this MVP)
-                # In a real backtester, we'd track entry/exit matched pairs
-                self.logger.info(f"Backtest Trade: {signal.signal} {signal.symbol} @ ${signal.price}")
+        sym = ticker.symbol
+        sig = signal.signal.value
+
+        if sig == 'BUY':
+            if sym not in self.open_positions:
+                # Open long
+                qty = 1.0
+                self.open_positions[sym] = {"side": "long", "entry_price": ticker.price, "qty": qty}
+                self.logger.info(f"Backtest OPEN LONG {sym} @ ${ticker.price}")
+            elif self.open_positions[sym]["side"] == "short":
+                # Close short
+                pos = self.open_positions.pop(sym)
+                pnl = (pos["entry_price"] - ticker.price) * pos["qty"]
+                self._record_trade(pnl, sym, ticker.price)
+
+        elif sig == 'SELL':
+            if sym not in self.open_positions:
+                # Open short
+                qty = 1.0
+                self.open_positions[sym] = {"side": "short", "entry_price": ticker.price, "qty": qty}
+                self.logger.info(f"Backtest OPEN SHORT {sym} @ ${ticker.price}")
+            elif self.open_positions[sym]["side"] == "long":
+                # Close long
+                pos = self.open_positions.pop(sym)
+                pnl = (ticker.price - pos["entry_price"]) * pos["qty"]
+                self._record_trade(pnl, sym, ticker.price)
+
+    def _record_trade(self, pnl: float, symbol: str, price: float):
+        self.metrics["total_trades"] += 1
+        self.metrics["total_pnl"] += pnl
+        if pnl > 0:
+            self.metrics["winning_trades"] += 1
+        self.risk.update_pnl(pnl)
+        self.equity_curve.append(self.risk.total_equity_usd)
+        self.logger.info(f"Backtest CLOSE {symbol} @ ${price} | PnL: ${pnl:.2f}")
 
     async def run_backtest(self):
         """Run the full backtest simulation."""
         self.logger.info(f"Starting Backtest for {self.symbol}...")
         await self.ingestor.run()
-        self.logger.info(f"Backtest complete. Results: {self.metrics}")
+
+        self.metrics["max_drawdown"] = calculate_max_drawdown(self.equity_curve)
+        win_rate = (
+            self.metrics["winning_trades"] / self.metrics["total_trades"]
+            if self.metrics["total_trades"] > 0 else 0.0
+        )
+        self.logger.info(
+            f"Backtest complete. Trades: {self.metrics['total_trades']} | "
+            f"PnL: ${self.metrics['total_pnl']:.2f} | "
+            f"Win Rate: {win_rate:.1%} | "
+            f"Max Drawdown: {self.metrics['max_drawdown']:.2%}"
+        )
 
 
 async def main():

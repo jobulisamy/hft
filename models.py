@@ -58,5 +58,7 @@ class Position(BaseModel):
     symbol: str
     quantity: float
     entry_price: float
+    side: str = "long"  # "long" or "short"
     unrealized_pnl: float = 0.0
+    realized_pnl: Optional[float] = None  # Set on close; None means position is open
     timestamp: datetime = Field(default_factory=datetime.utcnow)

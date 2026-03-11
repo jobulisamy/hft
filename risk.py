@@ -53,11 +53,10 @@ class RiskManager:
             return False
 
         # 3. Check Position Size
-        # Rough estimate: signal.price * quantity (simplifying for validation)
-        # Assuming fixed trade sizes for now in this MVP
-        if signal.price > self.max_position_size_usd:
-             self.logger.warning(f"Risk: Signal price ${signal.price} exceeds max position size limit.")
-             return False
+        order_value = signal.price * 1.0  # quantity of 1.0 matches execution.py
+        if order_value > self.max_position_size_usd:
+            self.logger.warning(f"Risk: Order value ${order_value} exceeds max position size limit.")
+            return False
 
         self.logger.info(f"Risk: Signal for {signal.symbol} validated successfully.")
         return True

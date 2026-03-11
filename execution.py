@@ -23,6 +23,9 @@ class ExecutionHandler:
         """
         self.symbol = symbol
         self.is_paper_trading = is_paper_trading
+        self.capital_usd = 10000.0
+        self.risk_per_trade = 0.05
+        self.open_positions: dict = {}  # symbol -> Position
         self.logger = logging.getLogger(__name__)
 
         # Initialize CCXT exchange object
@@ -43,33 +46,63 @@ class ExecutionHandler:
     async def execute_order(self, signal: OrderSignal) -> Optional[Position]:
         """
         Submits an order based on the signal using CCXT.
+        Opens a new position if none exists; closes the existing position on a reversal signal.
+        Returns the Position with realized_pnl set on close, or None if no action taken.
         """
         self.logger.info(f"Executing {signal.signal} order for {signal.symbol} at ${signal.price}...")
 
         try:
-            # Simple Market Order for MVP
-            # In a real setup, you might use Limit orders or check balance first
-            side = 'buy' if signal.signal.value == 'BUY' else 'sell'
-            
+            sig = signal.signal.value
+            sym = signal.symbol
+
+            if sig not in ('BUY', 'SELL'):
+                self.logger.debug(f"Ignoring non-actionable signal: {sig}")
+                return None
+
+            existing = self.open_positions.get(sym)
+
+            # Close existing position on reversal
+            if existing:
+                is_reversal = (existing.side == "long" and sig == 'SELL') or \
+                              (existing.side == "short" and sig == 'BUY')
+                if is_reversal:
+                    if existing.side == "long":
+                        pnl = (signal.price - existing.entry_price) * existing.quantity
+                    else:
+                        pnl = (existing.entry_price - signal.price) * existing.quantity
+
+                    closed = existing.model_copy(update={"realized_pnl": pnl})
+                    del self.open_positions[sym]
+                    self.logger.info(f"Closed {existing.side} {sym} @ ${signal.price} | PnL: ${pnl:.2f}")
+                    return closed
+                else:
+                    self.logger.debug(f"Already holding {existing.side} on {sym}, skipping same-direction signal.")
+                    return None
+
+            # Open new position
+            side = 'buy' if sig == 'BUY' else 'sell'
+            position_side = 'long' if sig == 'BUY' else 'short'
+            order_value = self.capital_usd * self.risk_per_trade
+            amount = round(order_value / signal.price, 6)
+
             if self.is_paper_trading and not self.exchange.apiKey:
-                # Fallback for mock/local verification if no keys provided
                 await asyncio.sleep(0.05)
-                self.logger.info(f"Mock Paper Trade success: {signal.symbol} @ ${signal.price}")
-                return Position(symbol=signal.symbol, quantity=1.0, entry_price=signal.price)
+                position = Position(symbol=sym, quantity=amount, entry_price=signal.price, side=position_side)
+                self.open_positions[sym] = position
+                self.logger.info(f"Opened {position_side} {sym} @ ${signal.price} qty={amount}")
+                return position
 
             order = await self.exchange.create_order(
-                symbol=signal.symbol,
+                symbol=sym,
                 type='market',
                 side=side,
-                amount=1.0  # Fixed qty for MVP
+                amount=amount
             )
-
+            fill_price = float(order['price']) if order['price'] else signal.price
+            position = Position(symbol=sym, quantity=float(order['amount']), entry_price=fill_price, side=position_side)
+            self.open_positions[sym] = position
             self.logger.info(f"Order successful! ID: {order['id']}")
-            return Position(
-                symbol=signal.symbol,
-                quantity=float(order['amount']),
-                entry_price=float(order['price']) if order['price'] else signal.price
-            )
+            return position
 
         except Exception as e:
             self.logger.error(f"Execution failed: {e}")
